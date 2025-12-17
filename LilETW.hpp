@@ -6,14 +6,27 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <format>
+#include <filesystem>
 #include <span>
 #include <unordered_map>
+#include <DbgHelp.h>
+#include <Psapi.h>
 #include <tdh.h>
 
 #ifdef _MSC_VER
 #pragma comment(lib, "tdh.lib")
+#pragma comment(lib, "dbghelp.lib")
 #endif
 
+#define InitializeObjectAttributes( p, n, a, r, s ) {	\
+    (p)->Length = sizeof( OBJECT_ATTRIBUTES );          \
+    (p)->RootDirectory = r;                             \
+    (p)->Attributes = a;                                \
+    (p)->ObjectName = n;                                \
+    (p)->SecurityDescriptor = s;                        \
+    (p)->SecurityQualityOfService = NULL;               \
+    }
 
 typedef struct _UNICODE_STRING {
 	USHORT Length;
@@ -21,11 +34,15 @@ typedef struct _UNICODE_STRING {
 	PWSTR  Buffer;
 } UNICODE_STRING;
 typedef UNICODE_STRING* PUNICODE_STRING;
+typedef const UNICODE_STRING* PCUNICODE_STRING;
 
 namespace LilETW {
 
 	template<typename T>
 	concept EtwSpecialType = std::is_same_v<T, UNICODE_STRING> || std::is_same_v<T, SID> || std::is_same_v<T, char>;
+
+	class Symbols;
+	class EventParser;
 
 	class TraceSessions {
 	public:
@@ -59,12 +76,12 @@ namespace LilETW {
 
 			PROCESSTRACE_HANDLE			handle;
 			EVENT_TRACE_LOGFILEW		logfile{};
-			ENABLE_TRACE_PARAMETERS*	params = nullptr;
+			ENABLE_TRACE_PARAMETERS* params = nullptr;
 
 			std::unique_ptr<ENABLE_TRACE_PARAMETERS>	trace_params;
 			std::vector<EVENT_FILTER_DESCRIPTOR>		filter_descs;
 			std::vector<std::unique_ptr<BYTE[]>>		filter_mem;
-						
+
 			auto size = static_cast<ULONG>(sizeof(EVENT_TRACE_PROPERTIES)) + static_cast<ULONG>(512 * sizeof(wchar_t));
 			auto buffer = std::make_unique<BYTE[]>(size);
 
@@ -72,20 +89,20 @@ namespace LilETW {
 
 			auto trace_properties = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(buffer.get());
 
-			trace_properties->Wnode.Flags			= WNODE_FLAG_TRACED_GUID;
-			trace_properties->Wnode.BufferSize		= size;
-			trace_properties->Wnode.ClientContext	= 1;
+			trace_properties->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+			trace_properties->Wnode.BufferSize = size;
+			trace_properties->Wnode.ClientContext = 1;
 
-			trace_properties->BufferSize		= 0x1000 * BufferPageSizeMultiplier;
-			trace_properties->LogFileMode		= EVENT_TRACE_REAL_TIME_MODE | (SystemLogger ? EVENT_TRACE_SYSTEM_LOGGER_MODE : 0);
-			trace_properties->MinimumBuffers	= 0;
-			trace_properties->LoggerNameOffset	= sizeof(EVENT_TRACE_PROPERTIES);
-			trace_properties->LogFileNameOffset	= 0;
+			trace_properties->BufferSize = 0x1000 * BufferPageSizeMultiplier;
+			trace_properties->LogFileMode = EVENT_TRACE_REAL_TIME_MODE | (SystemLogger ? EVENT_TRACE_SYSTEM_LOGGER_MODE : 0);
+			trace_properties->MinimumBuffers = 0;
+			trace_properties->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+			trace_properties->LogFileNameOffset = 0;
 
-			logfile.LogFileName			= nullptr;
-			logfile.LoggerName			= Tracename.data();
-			logfile.ProcessTraceMode	= PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
-			logfile.EventRecordCallback	= Callback;
+			logfile.LogFileName = nullptr;
+			logfile.LoggerName = Tracename.data();
+			logfile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+			logfile.EventRecordCallback = Callback;
 
 			if (!FilterIds.empty() || !StacktraceIds.empty()) {
 
@@ -104,13 +121,13 @@ namespace LilETW {
 					}
 
 					EVENT_FILTER_DESCRIPTOR desc{};
-					desc.Ptr	= reinterpret_cast<ULONGLONG>(filter);
-					desc.Size	= static_cast<ULONG>(filter_size);
-					desc.Type	= type;
+					desc.Ptr = reinterpret_cast<ULONGLONG>(filter);
+					desc.Size = static_cast<ULONG>(filter_size);
+					desc.Type = type;
 
 					filter_mem.push_back(std::move(mem));
 					return desc;
-				};
+					};
 
 				if (!FilterIds.empty()) {
 					filter_descs.push_back(create_filter(FilterIds, EVENT_FILTER_TYPE_EVENT_ID));
@@ -123,10 +140,10 @@ namespace LilETW {
 				trace_params = std::make_unique<ENABLE_TRACE_PARAMETERS>();
 				std::memset(trace_params.get(), 0, sizeof(ENABLE_TRACE_PARAMETERS));
 
-				trace_params->Version			= ENABLE_TRACE_PARAMETERS_VERSION_2;
-				trace_params->EnableFilterDesc	= filter_descs.data();
-				trace_params->FilterDescCount	= static_cast<ULONG>(filter_descs.size());
-				trace_params->EnableProperty	= StacktraceIds.empty() ? 0 : EVENT_ENABLE_PROPERTY_STACK_TRACE;
+				trace_params->Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
+				trace_params->EnableFilterDesc = filter_descs.data();
+				trace_params->FilterDescCount = static_cast<ULONG>(filter_descs.size());
+				trace_params->EnableProperty = StacktraceIds.empty() ? 0 : EVENT_ENABLE_PROPERTY_STACK_TRACE;
 
 				params = trace_params.get();
 			}
@@ -186,6 +203,176 @@ namespace LilETW {
 	};
 
 
+	class Symbols {
+	private:
+
+		typedef struct _OBJECT_DIRECTORY_INFORMATION {
+			UNICODE_STRING Name;
+			UNICODE_STRING TypeName;
+		} OBJECT_DIRECTORY_INFORMATION, * POBJECT_DIRECTORY_INFORMATION;
+
+		typedef struct _OBJECT_ATTRIBUTES {
+			ULONG Length;
+			HANDLE RootDirectory;
+			PCUNICODE_STRING ObjectName;
+			ULONG Attributes;
+			PVOID SecurityDescriptor;
+			PVOID SecurityQualityOfService;
+		} OBJECT_ATTRIBUTES, * POBJECT_ATTRIBUTES;
+
+		struct SymbolInfo {
+			DWORD64 address;
+			DWORD64 size;
+			std::string name;
+		};
+
+		struct ModuleInfo {
+			uintptr_t base;
+			uintptr_t end;
+			std::string mod_name;
+
+			bool operator==(const ModuleInfo& rnd) const noexcept {
+				return base == rnd.base && end == rnd.end;
+			}
+		};
+
+		struct ModuleInfoHash {
+			std::size_t operator()(const ModuleInfo& k) const noexcept {
+				auto h1 = std::hash<uintptr_t>{}(k.base);
+				auto h2 = std::hash<uintptr_t>{}(k.end);
+				return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
+			}
+		};
+
+	public:
+
+		static Symbols& Syms() {
+			static std::unique_ptr<Symbols> instance = std::make_unique<Symbols>();
+			return *instance;
+		}
+
+		using SymbolMap = std::unordered_map<DWORD64, SymbolInfo>;
+		std::unordered_map<ModuleInfo, SymbolMap, ModuleInfoHash> SymbolStore;
+
+		static BOOL EnumSymbolsCallback(_In_ PSYMBOL_INFO pSymInfo, _In_ ULONG SymbolSize, _In_ PVOID UserContext) {
+
+			SymbolMap* symbol_map	= static_cast<SymbolMap*>(UserContext);
+			SymbolInfo symbol_info	= { pSymInfo->Address, SymbolSize, pSymInfo->Name };
+
+			(*symbol_map)[pSymInfo->Address] = symbol_info;
+
+			return TRUE;
+		}
+
+		auto LoadSymbolsForModule(_In_ HMODULE hModule, _In_ PWSTR name) -> void {
+
+			MODULEINFO module = { 0 };
+
+			::GetModuleInformation((HANDLE)-1, hModule, &module, sizeof(module));
+
+			uintptr_t base_addr = reinterpret_cast<uintptr_t>(module.lpBaseOfDll);
+			uintptr_t end_addr	= base_addr + module.SizeOfImage;
+
+			std::wstring wstr(name);
+
+			ModuleInfo	module_info = { base_addr, end_addr, std::filesystem::path(wstr).stem().string() };
+			SymbolMap	symbol_map;
+
+			::SymEnumSymbols((HANDLE)-1, base_addr, nullptr, EnumSymbolsCallback, &symbol_map);
+
+			SymbolStore[module_info] = std::move(symbol_map);
+		}
+
+		auto ResolveSymbol(_In_ uintptr_t address) -> std::string {
+
+			for (const auto& [mod_info, symbols] : SymbolStore) {
+
+				if (address >= mod_info.base && address < mod_info.end) {
+
+					if (address == mod_info.base) {
+						return mod_info.mod_name;
+					}
+
+					auto it = symbols.find(static_cast<DWORD64>(address));
+
+					if (it != symbols.end()) {
+						return std::format("{}!{}", mod_info.mod_name, it->second.name);
+					}
+					else {
+
+						for (const auto& [sym_addr, sym_info] : symbols) {
+
+							if (address >= sym_addr && address < sym_addr + sym_info.size) {
+								return std::format("{}!{}+0x{:x}", mod_info.mod_name, sym_info.name, address - sym_addr);
+							}
+						}
+					}
+				}
+			}
+
+			return {};
+		}
+
+		Symbols() {
+
+			UNICODE_STRING					us			= { 0 };
+			OBJECT_ATTRIBUTES				oa			= { 0 };
+			NTSTATUS						status		= 0x00;
+			ULONG							uRet, uCtx	= 0x00;
+			HANDLE							directory	= nullptr;
+			HMODULE							module		= nullptr;
+			OBJECT_DIRECTORY_INFORMATION*	dir_info	= nullptr;
+
+			HMODULE ntdll = ::GetModuleHandleW(TEXT("NTDLL.DLL"));
+			static WCHAR sKnownDLLs[] = L"\\KnownDlls";
+
+			us.Buffer = sKnownDLLs;
+			us.Length = static_cast<USHORT>(std::wcslen(sKnownDLLs) * sizeof(WCHAR));
+			us.MaximumLength = us.Length + sizeof(WCHAR);
+
+			InitializeObjectAttributes(&oa, &us, 0x40, nullptr, nullptr);
+
+			::SymInitialize((HANDLE)-1, nullptr, true);
+
+			auto pNtOpenDirectoryObject = reinterpret_cast<NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES)>(::GetProcAddress(ntdll, "NtOpenDirectoryObject"));
+			auto pNtQueryDirectoryObject = reinterpret_cast<NTSTATUS(NTAPI*)(HANDLE, PVOID, ULONG, BOOLEAN, BOOLEAN, PULONG, PULONG)>(::GetProcAddress(ntdll, "NtQueryDirectoryObject"));
+
+			if ((status = pNtOpenDirectoryObject(&directory, 0x1 | 0x2, &oa)) != 0x00) {
+				return;
+			}
+
+			dir_info = reinterpret_cast<OBJECT_DIRECTORY_INFORMATION*>(::HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 2048));
+
+			for (;;) {
+
+				if ((status = pNtQueryDirectoryObject(directory, dir_info, 2048, true, false, &uCtx, &uRet)) == 0x8000001A) {
+					break;
+				}
+
+				::CharLowerW(dir_info->Name.Buffer);
+
+				if ((module = ::GetModuleHandleW(dir_info->Name.Buffer)) == nullptr) {
+					module = ::LoadLibraryW(dir_info->Name.Buffer);
+				}
+
+				LoadSymbolsForModule(module, dir_info->Name.Buffer);
+			}
+
+			if (directory) {
+				::CloseHandle(directory);
+			}
+
+			if (dir_info) {
+				::HeapFree(GetProcessHeap(), 0, dir_info);
+			}
+		}
+
+		~Symbols() {
+			::SymCleanup((HANDLE)-1);
+		}
+	};
+
+
 	class EventParser {
 	public:
 
@@ -208,6 +395,10 @@ namespace LilETW {
 
 		ULONG GetProcessId() const {
 			return m_EventRecord->EventHeader.ProcessId;
+		}
+
+		std::string ResolveSymbol(uintptr_t address) const {
+			return Symbols::Syms().ResolveSymbol(address);
 		}
 
 		template<typename T>
@@ -235,9 +426,9 @@ namespace LilETW {
 					continue;
 				}
 
-				data_desc.Reserved		= 0;
-				data_desc.ArrayIndex	= ULONG_MAX;
-				data_desc.PropertyName	= reinterpret_cast<ULONGLONG>(
+				data_desc.Reserved = 0;
+				data_desc.ArrayIndex = ULONG_MAX;
+				data_desc.PropertyName = reinterpret_cast<ULONGLONG>(
 					reinterpret_cast<BYTE*>(m_EventInfo) + property_info->NameOffset
 				);
 
@@ -252,7 +443,7 @@ namespace LilETW {
 						return ReturnTypes{};
 					}
 				}
-				
+
 				if constexpr (EtwSpecialType<T>) {
 					return RetrieveSpecial<T>(data_desc, property_len);
 				}
@@ -267,14 +458,14 @@ namespace LilETW {
 
 	private:
 
-		EVENT_RECORD*			m_EventRecord;
-		TRACE_EVENT_INFO*		m_EventInfo	= nullptr;
+		EVENT_RECORD* m_EventRecord;
+		TRACE_EVENT_INFO* m_EventInfo = nullptr;
 		std::unique_ptr<BYTE[]> m_EventInfoBuffer;
 
 		auto RetrieveEventInfo() -> void {
 
-			ULONG buffer_size	= 0;
-			ULONG status		= ::TdhGetEventInformation(m_EventRecord, 0, nullptr, nullptr, &buffer_size);
+			ULONG buffer_size = 0;
+			ULONG status = ::TdhGetEventInformation(m_EventRecord, 0, nullptr, nullptr, &buffer_size);
 
 			if (status != ERROR_INSUFFICIENT_BUFFER) {
 				std::printf("TdhGetEventInformation query failed: %lu\n", status);
@@ -350,6 +541,7 @@ namespace LilETW {
 		}
 
 	};
+
 }
 
 #endif // !LILETW_HPP
