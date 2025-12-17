@@ -8,6 +8,7 @@
 #include <string>
 #include <format>
 #include <filesystem>
+#include <functional>
 #include <span>
 #include <unordered_map>
 #include <DbgHelp.h>
@@ -148,6 +149,19 @@ namespace LilETW {
 				params = trace_params.get();
 			}
 
+			bool guard_active = true;
+
+			auto stop_guard = [&]() noexcept {
+				if (guard_active && handle != INVALID_PROCESSTRACE_HANDLE) {
+					::ControlTraceW(0, Tracename.data(), trace_properties, EVENT_TRACE_CONTROL_STOP);
+				}
+			};
+			struct ScopeGuard {
+				std::function<void()> f;
+				~ScopeGuard() noexcept { try { f(); } catch (...) {} }
+			};
+			ScopeGuard guard{ stop_guard };
+
 			auto status = ::StartTraceW(&handle, Tracename.data(), trace_properties);
 
 			if (status != ERROR_SUCCESS) {
@@ -165,6 +179,7 @@ namespace LilETW {
 				return INVALID_PROCESSTRACE_HANDLE;
 			}
 
+			guard_active = false;
 			m_TraceSessions.emplace(handle, TraceSessionData{ handle, std::move(buffer), Tracename });
 			return handle;
 		}
