@@ -534,9 +534,9 @@ namespace LilETW {
 
 			auto offset = 0;
 
-			if constexpr (std::is_same_v<T, SID>) {
-				offset = 16;
-			}
+			// if constexpr (std::is_same_v<T, SID>) {
+			// 	offset = 16;
+			// }
 
 			void* raw = ::operator new(size - offset, std::nothrow);
 
